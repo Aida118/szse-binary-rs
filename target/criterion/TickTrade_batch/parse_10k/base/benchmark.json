@@ -1,0 +1,1 @@
+{"group_id":"TickTrade_batch","function_id":"parse_10k","value_str":null,"throughput":{"Elements":10000},"full_id":"TickTrade_batch/parse_10k","directory_name":"TickTrade_batch/parse_10k","title":"TickTrade_batch/parse_10k"}

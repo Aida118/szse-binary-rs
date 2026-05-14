@@ -9,3 +9,8 @@ keywords = ["finance", "market-data", "szse", "trading", "parser"]
 categories = ["parser-implementations", "finance"]
 
 [dependencies]
+criterion= { version = "0.5", features = ["html_reports"]}
+
+[[bench]]
+name = "parse_bench"
+harness = false

@@ -47,6 +47,16 @@ if header.msg_type == 300191 {
 - [ ] `no_std` support
 - [ ] Benchmark vs C++ baseline
 
+## Performance
+
+Benchmarked on AMD Ryzen 9 7940HX with Radeon Graphics, single-threaded:
+
+| Message | Throughput |
+|---------|-----------|
+| TickTrade parse | 34.189 ns/msg (1.7979 GiB/s) |
+| MsgHeader parse | 4.777 ns/msg |
+
+
 ## License
 
 MIT
