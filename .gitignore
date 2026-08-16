@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Backup / editor files
+*.bak
+*~
+.DS_Store
+
+# Local sample data (exchange base files & captures) — never commit real market data
+/samples
+*.pcap
+*.pcapng
+MinerU_*.md

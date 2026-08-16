@@ -2,14 +2,17 @@
 name = "szse-binary-rs"
 version = "0.1.0"
 edition = "2024"
-description= "Parser for SSE binary market data protocol (Ver1.17)"
+description = "Dependency-free parser for the Shenzhen Stock Exchange (SZSE) Binary market data protocol"
 license = "MIT"
 repository = "https://github.com/Aida118/szse-binary-rs"
+readme = "README.md"
 keywords = ["finance", "market-data", "szse", "trading", "parser"]
 categories = ["parser-implementations", "finance"]
 
 [dependencies]
-criterion= { version = "0.5", features = ["html_reports"]}
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "parse_bench"
