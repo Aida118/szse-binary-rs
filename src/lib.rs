@@ -1,364 +1,177 @@
+// src/lib.rs
 //! # szse-binary-rs
 //!
-//! Parser for the Shenzhen Stock Exchange (SZSE) Binary market data protocol.
+//! A dependency-free parser for the **Shenzhen Stock Exchange (SZSE) Binary
+//! market-data protocol** (深圳证券交易所 Binary 行情数据接口规范).
 //!
-//! Based on: 深圳证券交易所 Binary 行情数据接口规范 Ver1.17 (2025-03)
+//! Every message is `header (8B) + body + checksum tail (4B)`. The header
+//! carries `MsgType` and `BodyLength`; this crate decodes the body for each
+//! supported `MsgType` into a typed struct.
 //!
-//! ## Supported Messages
-//! - Message Header (消息头)
-//! - Tick-by-tick Trade / 逐笔成交 (MsgType=300191)
-//! - Tick-by-tick Order / 逐笔委托 (MsgType=300192)
+//! ## Quick start
 //!
-//! ## Note on types
-//! All integers are big-endian (network byte order) per the spec.
-//! Price fields use N13(4): Int64 value 186400 means price 18.6400.
-//! Qty fields use N15(2), Amt fields use N18(4).
+//! ```
+//! use szse_binary_rs::{Message, parse_frame};
+//!
+//! # fn demo(frame: &[u8]) -> Result<(), szse_binary_rs::ParseError> {
+//! // `frame` = one full message: header + body (+ optional checksum tail)
+//! match parse_frame(frame)? {
+//!     Message::TickTrade(t) => {
+//!         println!("{} @ {:.4} x {:.0}", t.security_id_str(), t.last_px_f64(), t.last_qty_f64());
+//!     }
+//!     Message::Snapshot(s) => println!("snapshot for {}", s.header.security_id_str()),
+//!     other => println!("got {other:?}"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Encoding notes
+//!
+//! - All integers are **big-endian** (数据字典 §5).
+//! - Decimals are scaled integers, `Nx(y)`. See [`types::primitives`] for the
+//!   per-field divisors (price `/10_000`, qty `/100`, `MDEntryPx` `/1_000_000`).
+//! - Strings are UTF-8, right-padded with spaces; use the `*_str()` accessors.
 
-// ─────────────────────────────────────────────
-// Error type
-// ─────────────────────────────────────────────
+mod error;
+mod header;
+mod utils;
 
-#[derive(Debug, PartialEq)]
-pub enum ParseError {
-    /// Buffer is shorter than required
-    BufferTooShort { needed: usize, got: usize },
-    /// Message type is not recognised by this parser
-    UnknownMsgType(u32),
+pub mod messages;
+pub mod types;
+
+pub use error::ParseError;
+pub use header::{MSG_HEADER_LEN, MsgHeader};
+pub use messages::*;
+pub use types::*;
+pub use utils::{checksum, require_len, trimmed_str};
+
+/// A decoded SZSE Binary message: header type + typed body.
+///
+/// Tick orders and snapshots need the `MsgType` to pick their extension, so
+/// the dispatcher in [`parse_frame`] passes it through for you.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Logon(Logon),
+    Logout(Logout),
+    Heartbeat,
+    ChannelHeartbeat(ChannelHeartbeat),
+    Resend(Resend),
+    BusinessReject(BusinessReject),
+    /// Tick-by-tick trade plus the message type it arrived under.
+    TickTrade(TickTrade),
+    /// Tick-by-tick order with its stream-specific extension (if any).
+    TickOrder {
+        order: TickOrder,
+        extension: Option<OrderExtension>,
+    },
+    Snapshot(Snapshot),
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::BufferTooShort { needed, got } =>
-                write!(f, "buffer too short: need {} bytes, got {}", needed, got),
-            ParseError::UnknownMsgType(t) =>
-                write!(f, "unknown message type: {}", t),
+/// Parse one complete frame: read the 8-byte header, then decode the body
+/// according to its `MsgType`.
+///
+/// `frame` must start at the message header. A trailing 4-byte checksum is
+/// tolerated but not required — the body is sliced using `BodyLength` when
+/// present, otherwise it extends to the end of `frame`. Unknown message
+/// types yield [`ParseError::UnknownMsgType`].
+///
+/// This does **not** verify the checksum; call [`verify_checksum`] separately
+/// if your transport does not already guarantee integrity.
+pub fn parse_frame(frame: &[u8]) -> Result<Message, ParseError> {
+    let header = MsgHeader::parse(frame)?;
+    let body_len = header.body_length as usize;
+    let avail = frame.len() - MSG_HEADER_LEN;
+    // Trust BodyLength when it fits; otherwise fall back to whatever remains.
+    let end = MSG_HEADER_LEN + body_len.min(avail);
+    let body = &frame[MSG_HEADER_LEN..end];
+
+    let msg = match header.msg_type {
+        1 => Message::Logon(Logon::parse(body)?),
+        2 => Message::Logout(Logout::parse(body)?),
+        3 => Message::Heartbeat,
+        390095 => Message::ChannelHeartbeat(ChannelHeartbeat::parse(body)?),
+        390094 => Message::Resend(Resend::parse(body)?),
+        8 => Message::BusinessReject(BusinessReject::parse(body)?),
+        300191 | 300591 | 300791 | 300291 | 300391 | 300491 => {
+            Message::TickTrade(TickTrade::parse(body)?)
         }
-    }
+        300192 | 300592 | 300792 | 300292 => {
+            let (order, extension) = TickOrder::parse_with_ext(body, header.msg_type)?;
+            Message::TickOrder { order, extension }
+        }
+        300111 | 300611 | 303711 | 309011 | 309111 => {
+            Message::Snapshot(Snapshot::parse(body, header.msg_type)?)
+        }
+        other => return Err(ParseError::UnknownMsgType(other)),
+    };
+    Ok(msg)
 }
 
-// ─────────────────────────────────────────────
-// Session-layer header  (消息头, section 4.2.1)
-// ─────────────────────────────────────────────
-
-/// Every SZSE Binary message begins with this 8-byte header.
+/// Verify the 4-byte checksum tail of a full frame (§4.1.2).
 ///
-/// Layout (all big-endian):
-/// | Offset | Size | Field      |
-/// |--------|------|------------|
-/// | 0      | 4    | MsgType    |
-/// | 4      | 4    | BodyLength |
-#[derive(Debug, Clone, PartialEq)]
-pub struct MsgHeader {
-    /// Message type, e.g. 300191 = tick-by-tick trade
-    pub msg_type: u32,
-    /// Length of the message body in bytes (excludes header and checksum tail)
-    pub body_length: u32,
-}
-
-pub const MSG_HEADER_LEN: usize = 8;
-
-impl MsgHeader {
-    pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
-        require_len(buf, MSG_HEADER_LEN)?;
-        Ok(MsgHeader {
-            msg_type:    u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-            body_length: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
-        })
-    }
-}
-
-// ─────────────────────────────────────────────
-// Tick-by-tick Trade  逐笔成交 (MsgType=300191)
-// section 4.5.6, table 4-15
-// ─────────────────────────────────────────────
-
-/// Execution type in a tick-by-tick trade message.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecType {
-    /// '4' – order cancelled (撤销)
-    Cancelled,
-    /// 'F' – trade executed (成交)
-    Trade,
-}
-
-/// Tick-by-tick trade message (逐笔成交, MsgType=300191).
-///
-/// Carried in channels 201x–205x depending on security type.
-/// The `appl_seq_num` is shared with tick-by-tick orders on the same channel.
-///
-/// Price unit: N13(4), i.e. divide raw Int64 by 10_000 to get yuan.
-/// Qty   unit: N15(2), divide by 100 to get shares.
-#[derive(Debug, Clone)]
-pub struct TickTrade {
-    /// Channel code (频道代码)
-    pub channel_no: u16,
-    /// Sequential record number within the channel, starting from 1
-    pub appl_seq_num: i64,
-    /// Market data stream ID, e.g. "011" = equity auction trade (行情类别)
-    pub md_stream_id: [u8; 3],
-    /// Bid-side order index; 0 = no corresponding order (买方委托索引)
-    pub bid_appl_seq_num: i64,
-    /// Offer-side order index; 0 = no corresponding order (卖方委托索引)
-    pub offer_appl_seq_num: i64,
-    /// Security code, ASCII, space-padded (证券代码)
-    pub security_id: [u8; 8],
-    /// Security code source, e.g. "102 " = SZSE (证券代码源)
-    pub security_id_source: [u8; 4],
-    /// Trade price, N13(4) — divide by 10_000 for yuan (成交价格)
-    pub last_px: i64,
-    /// Trade quantity, N15(2) — divide by 100 for shares (成交数量)
-    pub last_qty: i64,
-    /// Execution type (成交类别)
-    pub exec_type: ExecType,
-    /// Transaction timestamp YYYYMMDDHHMMSSsss (委托时间)
-    pub transact_time: i64,
-}
-
-/// Wire size of a TickTrade body (without header or checksum).
-/// channel_no(2) + appl_seq_num(8) + md_stream_id(3) +
-/// bid(8) + offer(8) + security_id(8) + source(4) +
-/// last_px(8) + last_qty(8) + exec_type(1) + transact_time(8) = 66 bytes
-pub const TICK_TRADE_BODY_LEN: usize = 66;
-
-impl TickTrade {
-    /// Parse a TickTrade from the **body** bytes (after the 8-byte header).
-    pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
-        require_len(buf, TICK_TRADE_BODY_LEN)?;
-
-        let exec_type = match buf[56] {
-            b'4' => ExecType::Cancelled,
-            b'F' => ExecType::Trade,
-            other => return Err(ParseError::UnknownMsgType(other as u32)),
-        };
-
-        Ok(TickTrade {
-            channel_no:           u16::from_be_bytes(buf[0..2].try_into().unwrap()),
-            appl_seq_num:         i64::from_be_bytes(buf[2..10].try_into().unwrap()),
-            md_stream_id:         buf[10..13].try_into().unwrap(),
-            bid_appl_seq_num:     i64::from_be_bytes(buf[13..21].try_into().unwrap()),
-            offer_appl_seq_num:   i64::from_be_bytes(buf[21..29].try_into().unwrap()),
-            security_id:          buf[29..37].try_into().unwrap(),
-            security_id_source:   buf[37..41].try_into().unwrap(),
-            last_px:              i64::from_be_bytes(buf[41..49].try_into().unwrap()),
-            last_qty:             i64::from_be_bytes(buf[49..57].try_into().unwrap()),
-            exec_type,
-            transact_time:        i64::from_be_bytes(buf[57..65].try_into().unwrap()),
-        })
-    }
-
-    /// Return price in yuan (元) as f64. Convenience helper.
-    pub fn last_px_f64(&self) -> f64 { self.last_px as f64 / 10_000.0 }
-
-    /// Return quantity in shares as f64.
-    pub fn last_qty_f64(&self) -> f64 { self.last_qty as f64 / 100.0 }
-
-    /// Return security code as a trimmed UTF-8 string.
-    pub fn security_id_str(&self) -> &str {
-        std::str::from_utf8(&self.security_id)
-            .unwrap_or("")
-            .trim_end()
-    }
-}
-
-// ─────────────────────────────────────────────
-// Tick-by-tick Order  逐笔委托 (MsgType=300192)
-// section 4.5.5, table 4-14
-// ─────────────────────────────────────────────
-
-/// Buy/sell direction (买卖方向).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Side {
-    Buy,   // '1'
-    Sell,  // '2'
-    Borrow, // 'G' 借入
-    Lend,   // 'F' 出借
-}
-
-/// Order type (订单类别, only for MsgType=300192 extension field).
-#[derive(Debug, Clone, PartialEq)]
-pub enum OrdType {
-    Market,       // '1' 市价
-    Limit,        // '2' 限价
-    BestOwn,      // 'U' 本方最优
-}
-
-/// Tick-by-tick order message (逐笔委托, MsgType=300192).
-#[derive(Debug, Clone)]
-pub struct TickOrder {
-    pub channel_no:         u16,
-    pub appl_seq_num:       i64,
-    pub md_stream_id:       [u8; 3],
-    pub security_id:        [u8; 8],
-    pub security_id_source: [u8; 4],
-    /// Limit price, N13(4)
-    pub price:              i64,
-    /// Order quantity, N15(2)
-    pub order_qty:          i64,
-    pub side:               Side,
-    pub transact_time:      i64,
-    /// Extension field: order type (from 300192 extension)
-    pub ord_type:           OrdType,
-}
-
-/// Wire size of TickOrder body including the 300192 extension byte.
-/// channel_no(2) + appl_seq_num(8) + md_stream_id(3) +
-/// security_id(8) + source(4) + price(8) + order_qty(8) +
-/// side(1) + transact_time(8) + ord_type(1) = 51 bytes
-pub const TICK_ORDER_BODY_LEN: usize = 51;
-
-impl TickOrder {
-    pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
-        require_len(buf, TICK_ORDER_BODY_LEN)?;
-
-        let side = match buf[41] {
-            b'1' => Side::Buy,
-            b'2' => Side::Sell,
-            b'G' => Side::Borrow,
-            b'F' => Side::Lend,
-            other => return Err(ParseError::UnknownMsgType(other as u32)),
-        };
-
-        let ord_type = match buf[50] {
-            b'1' => OrdType::Market,
-            b'2' => OrdType::Limit,
-            b'U' => OrdType::BestOwn,
-            other => return Err(ParseError::UnknownMsgType(other as u32)),
-        };
-
-        Ok(TickOrder {
-            channel_no:         u16::from_be_bytes(buf[0..2].try_into().unwrap()),
-            appl_seq_num:       i64::from_be_bytes(buf[2..10].try_into().unwrap()),
-            md_stream_id:       buf[10..13].try_into().unwrap(),
-            security_id:        buf[13..21].try_into().unwrap(),
-            security_id_source: buf[21..25].try_into().unwrap(),
-            price:              i64::from_be_bytes(buf[25..33].try_into().unwrap()),
-            order_qty:          i64::from_be_bytes(buf[33..41].try_into().unwrap()),
-            side,
-            transact_time:      i64::from_be_bytes(buf[42..50].try_into().unwrap()),
-            ord_type,
-        })
-    }
-
-    pub fn price_f64(&self) -> f64 { self.price as f64 / 10_000.0 }
-    pub fn order_qty_f64(&self) -> f64 { self.order_qty as f64 / 100.0 }
-    pub fn security_id_str(&self) -> &str {
-        std::str::from_utf8(&self.security_id)
-            .unwrap_or("")
-            .trim_end()
-    }
-}
-
-// ─────────────────────────────────────────────
-// Internal helper
-// ─────────────────────────────────────────────
-
-fn require_len(buf: &[u8], needed: usize) -> Result<(), ParseError> {
-    if buf.len() < needed {
-        Err(ParseError::BufferTooShort { needed, got: buf.len() })
-    } else {
+/// `frame` must include the trailing checksum: `header + body + checksum(4)`.
+/// The checksum covers `header + body` (everything but the last 4 bytes).
+pub fn verify_checksum(frame: &[u8]) -> Result<(), ParseError> {
+    require_len(frame, MSG_HEADER_LEN + 4)?;
+    let split = frame.len() - 4;
+    let declared = u32::from_be_bytes(frame[split..].try_into().unwrap());
+    let computed = checksum(&frame[..split]);
+    if declared == computed {
         Ok(())
+    } else {
+        Err(ParseError::ChecksumMismatch { declared, computed })
     }
 }
-
-// ─────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── MsgHeader ──────────────────────────────
-
-    #[test]
-    fn header_too_short() {
-        let buf = [0u8; 5];
-        assert_eq!(
-            MsgHeader::parse(&buf),
-            Err(ParseError::BufferTooShort { needed: 8, got: 5 })
-        );
+    fn framed(msg_type: u32, body: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&msg_type.to_be_bytes());
+        f.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        f.extend_from_slice(body);
+        f
     }
 
     #[test]
-    fn header_parses_msg_type() {
-        let mut buf = [0u8; 8];
-        // MsgType = 300191 = 0x0004_939F
-        buf[0..4].copy_from_slice(&300191u32.to_be_bytes());
-        buf[4..8].copy_from_slice(&66u32.to_be_bytes());
-        let h = MsgHeader::parse(&buf).unwrap();
-        assert_eq!(h.msg_type, 300191);
-        assert_eq!(h.body_length, 66);
-    }
-
-    // ── TickTrade ──────────────────────────────
-
-    fn sample_tick_trade_buf() -> Vec<u8> {
-        let mut buf = vec![0u8; TICK_TRADE_BODY_LEN];
-        // channel_no = 2011
-        buf[0..2].copy_from_slice(&2011u16.to_be_bytes());
-        // appl_seq_num = 1
-        buf[2..10].copy_from_slice(&1i64.to_be_bytes());
-        // md_stream_id = "011"
-        buf[10..13].copy_from_slice(b"011");
-        // bid = 100, offer = 200
-        buf[13..21].copy_from_slice(&100i64.to_be_bytes());
-        buf[21..29].copy_from_slice(&200i64.to_be_bytes());
-        // security_id = "000001  " (平安银行)
-        buf[29..37].copy_from_slice(b"000001  ");
-        // security_id_source = "102 "
-        buf[37..41].copy_from_slice(b"102 ");
-        // last_px = 186400 → 18.6400 yuan
-        buf[41..49].copy_from_slice(&186400i64.to_be_bytes());
-        // last_qty = 100000 → 1000.00 shares
-        buf[49..57].copy_from_slice(&100000i64.to_be_bytes());
-        // exec_type = 'F' (成交)
-        buf[56] = b'F';
-        // transact_time = 20250512093000000
-        buf[57..65].copy_from_slice(&20250512093000000i64.to_be_bytes());
-        buf
+    fn dispatches_heartbeat() {
+        let frame = framed(3, &[]);
+        assert_eq!(parse_frame(&frame).unwrap(), Message::Heartbeat);
     }
 
     #[test]
-    fn tick_trade_parses_correctly() {
-        let buf = sample_tick_trade_buf();
-        let t = TickTrade::parse(&buf).unwrap();
-        assert_eq!(t.channel_no, 2011);
-        assert_eq!(t.appl_seq_num, 1);
-        assert_eq!(t.exec_type, ExecType::Trade);
-        assert_eq!(t.last_px_f64(), 18.6400);
-        assert_eq!(t.security_id_str(), "000001");
+    fn dispatches_tick_trade() {
+        let mut body = vec![0u8; TICK_TRADE_BODY_LEN];
+        body[0..2].copy_from_slice(&2011u16.to_be_bytes());
+        body[57] = b'F';
+        let frame = framed(300191, &body);
+        match parse_frame(&frame).unwrap() {
+            Message::TickTrade(t) => assert_eq!(t.channel_no, 2011),
+            other => panic!("expected TickTrade, got {other:?}"),
+        }
     }
 
     #[test]
-    fn tick_trade_too_short() {
-        let buf = [0u8; 10];
+    fn unknown_type_errors() {
+        let frame = framed(424242, &[]);
+        assert_eq!(parse_frame(&frame), Err(ParseError::UnknownMsgType(424242)));
+    }
+
+    #[test]
+    fn checksum_round_trips() {
+        let mut frame = framed(3, &[]);
+        let cks = checksum(&frame);
+        frame.extend_from_slice(&cks.to_be_bytes());
+        assert!(verify_checksum(&frame).is_ok());
+
+        // corrupt the body type and the checksum must fail
+        frame[0] ^= 0xFF;
         assert!(matches!(
-            TickTrade::parse(&buf),
-            Err(ParseError::BufferTooShort { .. })
+            verify_checksum(&frame),
+            Err(ParseError::ChecksumMismatch { .. })
         ));
-    }
-
-    // ── TickOrder ──────────────────────────────
-
-    #[test]
-    fn tick_order_buy_limit() {
-        let mut buf = vec![0u8; TICK_ORDER_BODY_LEN];
-        buf[0..2].copy_from_slice(&2011u16.to_be_bytes());
-        buf[2..10].copy_from_slice(&42i64.to_be_bytes());
-        buf[10..13].copy_from_slice(b"011");
-        buf[13..21].copy_from_slice(b"000001  ");
-        buf[21..25].copy_from_slice(b"102 ");
-        buf[25..33].copy_from_slice(&186400i64.to_be_bytes()); // 18.64 yuan
-        buf[33..41].copy_from_slice(&100000i64.to_be_bytes()); // 1000 shares
-        buf[41] = b'1'; // Buy
-        buf[42..50].copy_from_slice(&20250512093000000i64.to_be_bytes());
-        buf[50] = b'2'; // Limit
-
-        let o = TickOrder::parse(&buf).unwrap();
-        assert_eq!(o.side, Side::Buy);
-        assert_eq!(o.ord_type, OrdType::Limit);
-        assert_eq!(o.price_f64(), 18.64);
-        assert_eq!(o.security_id_str(), "000001");
     }
 }
